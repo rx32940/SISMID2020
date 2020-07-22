@@ -1,0 +1,246 @@
+---
+title: "SISMID_POMP_SIM"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### loading packages and dataset
+```{r}
+
+library(tidyverse)
+library(doParallel)
+library(doRNG)
+registerDoParallel()
+registerDoRNG(2488820)
+read_csv(paste0("http://kingaa.github.io/sbied/stochsim/", "Measles_Consett_1948.csv")) %>%
+  select(week, reports=cases) -> meas # change colname cases to reports
+
+meas %>%  as.data.frame() %>% head() # view the meas data as dataframe
+```
+
+## POMP model in R script
+**components:**
+  - rprocess
+  - rmeasure
+  - optional: dmeasure
+  
+**For DEMONSTRATION ONLY**
+- slower in computational time
+- code written in Csnippt speed up the process
+
+
+### set up one step transition simulator for the unoberserved state process
+    - simple counting process, f(Xt|Xt-1), rprocess
+      - count one event at a time (t), in this case, a **stochastic process**
+    - **Euler's method**:approximation (numerical) solution of ODE function 
+      - stepping foward in time increments, Delta.t, where Delta.t < t
+    - S(t), I(t), R(t), **unobserved state variables**
+    - rho, probability of reporting 
+    - H, number of reported cases (for measles, much lower transmission rate after reporting, thus relate to I->R)
+      - **accumlator variable**, time unit in t, instead of delta.t
+        - reset to 0 at beginning of each week
+```{r}
+# # set up in R
+# # set up transition step into a function
+# sir_step <- function(S,I,R,H,N,Beta, mu_IR, delta.t,...){
+# 
+#   # Euler method chosen, binomial approximation with exponential transition  probability, Binomial[X=aprox(S(t)), p=1-exp{-Mu_SI(approx(I(t))delta.t)}],where p is the probability of one unit of susceptible moving to the infected class
+# 
+#   # rate of changes between compartments, counting process, which is the flow between compartments
+#   dN_SI <- rbinom(n=1, size=S, prob=1-exp(-Beta*I/N*delta.t)) # Delta_N_SI, S->I, over Delta.t
+#   dN_IR <- rbinom(n=1, size = I, prob=1-exp()) # Delta_N_IR, I->R, over Delta.t
+# 
+#   # Compartments
+#   S <- S - dN_SI # S(t)
+#   I <- I + dN_SI -dN_IR # I(t)
+#   R <- R + dN_IR # R(t)
+#   H <- H + dN_IR
+#   c(S = S, I = I, R = R) # combine the returning results into vector c()
+#   }
+
+```
+
+### Initial status, day 0
+```{r}
+# # eta, fraction of N that are susceptible
+# sir_rinit <- function(N, eta, ...){
+# 
+#   c(S= round(n * eta), I = 1, R = round(N*(1-eta)))
+# 
+# }
+
+```
+
+---
+
+
+### Define rmeasure and dmeasure
+    - since our data, reports, is the results of reported cases
+    - model data, f(Yt|Xt),into a binomial process
+      - reports_t ~ Binomial[X= H(t), p= rho], where rho is the probability of reporting
+```{r}
+# 
+# # dmeasure, Evaulating the density of f(Yt|Xt) at report given Xt = H(t)
+# # report log function, if specify= TRUE
+# sir_dmeas <- function(reports, H, rho, log, ...){
+#   dbinom(x=reports, size=H,prob=rho, log=log) # report the evaulation results in log
+# }
+# 
+# # rmeasure, drawing from the density distribution, f(Yt|Xt) given Xt=H(t)
+# sir_rmeas <- function(H, reports, ...){
+#   c(reports=rbinom(n=1, size=H, prob=rho))
+# }
+
+
+```
+
+## POMP model
+
+### Building POMP model
+- using **accumvars** arguments to specify **accumulator variable**
+```{r}
+# 
+# meas %>% 
+#   pomp(
+#     times = "week", t0=0, # t = week
+#     rprocess = euler(sir_step,delta.t = 1/7), # delta.t = day
+#     rinit=sir_rinit,
+#     accumvars = "H",
+#     rmeasure=sir_rmeas,
+#     dmeasure=sir_dmeas
+#     ) -> measSIR
+
+```
+
+---
+
+## POMP model in Csnippt
+   - speed up the computational time
+   
+### Write all components in Csnippts
+```{r}
+sir_step <- Csnippet("
+                     double dN_SI = rbinom(S, 1-exp(-Beta*I/N*dt));
+                     double dN_IR = rbinom(I, 1-exp(-mu_IR * dt));
+                     S -= dN_SI;
+                     I +=dN_SI - dN_IR;
+                     R += dN_IR;
+                     H += dN_IR; 
+                     ")
+
+sir_rinit <- Csnippet("
+                      S = nearbyint(eta * N);
+                      I = 1;
+                      R = nearbyint((1-eta) * N);
+                      ")
+
+sir_dmeas <- Csnippet("
+                      lik = dbinom(reports, H, rho, give_log);
+                      ")
+
+sir_rmeas <- Csnippet("
+                      reports = rbinom(H, rho);
+                      ")
+
+
+```
+
+
+### Define POMP model with Csnippts
+
+```{r}
+library(pomp)
+
+meas %>% 
+  pomp(
+    times = "week", t0=0, # t = week
+    rprocess = euler(sir_step,delta.t = 1/7), # delta.t = day
+    rinit=sir_rinit,
+    accumvars = "H",
+    rmeasure=sir_rmeas,
+    dmeasure=sir_dmeas,
+    statenames = c("S", "I","R","H"), # unobserved state variable stated in Csnippet
+    paramnames = c("Beta", "mu_IR","N","eta","rho") # parameter values need to specify
+  ) -> measSIR
+
+measSIR
+
+
+```
+
+### Simulate
+- start with choosing plausible parameter values
+
+```{r}
+measSIR %>% 
+  simulate(params=c(Beta=7.5,mu_IR=0.5,rho=0.5,eta=0.03,N=38000),
+           nsim=20,format="data.frame",include.data=TRUE
+           )-> sims
+
+# blue: data, red = simulation
+sims %>% 
+  ggplot(aes(x=week,y=reports,group=.id,color=.id == "data"))+
+  geom_line()+
+  guides(color=FALSE)
+```
+
+## Exercise: SEIR model
+- add a E compartment
+```{r}
+seir_step <- Csnippet("
+  double dN_SE = rbinom(S,1-exp(-Beta*I/N*dt));
+  double dN_EI = rbinom(E, 1-exp(-mu_EI*dt));
+  double dN_IR = rbinom(I,1-exp(-mu_IR*dt));
+  S -= dN_SE;
+  E += dN_SE - dN_EI;
+  I += dN_EI - dN_IR;
+  R += dN_IR;
+  H += dN_IR;
+  ")
+
+seir_rinit <- Csnippet("
+  S = nearbyint(eta*N);
+  E = 0;
+  I = 1;
+  R = nearbyint((1-eta)*N);
+  H = 0;
+  ")
+
+seir_dmeas <- Csnippet("
+  lik = dbinom(reports,H,rho,give_log);
+  ")
+
+seir_rmeas <- Csnippet("
+  reports = rbinom(H,rho);
+  ")
+
+# excercise 2: changed from a SIR model to a SEIR model 
+#   added parameter "mu_EI" into "paramnames" vector
+# added "E" into "statenames" vector
+meas %>%
+  pomp(
+      times = "week", t0=0, # t = week,
+       rprocess=euler(seir_step,delta.t=1/7),
+       rinit=seir_rinit,
+       rmeasure=seir_rmeas,
+       dmeasure=seir_dmeas,
+       accumvars="H",
+       statenames=c("S","I","E","R","H"),
+       paramnames=c("Beta","mu_IR","mu_EI","N","eta","rho")
+       ) -> measSEIR
+
+measSEIR %>% 
+  simulate(params=c(Beta=7.5,mu_IR=0.5,mu_EI=0.66,rho=0.5,eta=0.03,N=38000),
+           nsim=20,format="data.frame",include.data=TRUE
+           )-> sims_seir
+
+# blue: data, red = simulation
+sims_seir %>% 
+  ggplot(aes(x=week,y=reports,group=.id,color=.id == "data"))+
+  geom_line()+
+  guides(color=FALSE)
+
+```

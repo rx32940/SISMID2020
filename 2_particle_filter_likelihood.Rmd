@@ -1,0 +1,166 @@
+---
+title: "particle_filter"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Particle filter
+- also known as, sequential monte carlo (SMC)
+- calculate the **likelihood** of a POMP model
+- **likelihood based inference** ::
+  - statistical tool based on likelihood function
+- **two steps** in recursion: prediction distribution and filtering distribution
+- Monte Carlo technique
+- complemented the **cons** of generating the monte carlo likelihood trajectories by **direct simulation**
+  - purely based on rprocess
+  - only feasible with short dataset
+  - scales poorly with dimension
+
+---
+
+### POMP model 
+**sir model**
+- add a E compartment
+```{r}
+library(tidyverse)
+library(pomp)
+
+sir_step <- Csnippet("
+double dN_SI = rbinom(S,1-exp(-Beta*I/N*dt));
+double dN_IR = rbinom(I,1-exp(-mu_IR*dt));
+S -= dN_SI;
+I += dN_SI - dN_IR;
+R += dN_IR;
+H += dN_IR;
+")
+
+sir_init <- Csnippet("
+S = nearbyint(eta*N);
+I = 1;
+R = nearbyint((1-eta)*N);
+H = 0;
+")
+
+dmeas <- Csnippet("
+lik = dbinom(reports,H,rho,give_log);
+")
+
+rmeas <- Csnippet("
+reports = rbinom(H,rho);
+")
+
+read_csv("https://kingaa.github.io/sbied/pfilter/Measles_Consett_1948.csv") %>%
+  select(week,reports=cases) %>%
+  filter(week<=42) %>%
+  pomp(
+    times="week",t0=0,
+    rprocess=euler(sir_step,delta.t=1/7),
+    rinit=sir_init,
+    rmeasure=rmeas,
+    dmeasure=dmeas,
+    accumvars="H",
+    statenames=c("S","I","R","H"),
+    paramnames=c("Beta","mu_IR","eta","rho","N"),
+    params=c(Beta=15,mu_IR=0.5,rho=0.5,eta=0.06,N=38000) # need to specify param values
+  ) -> measSIR
+
+```
+
+### Particle Filtering
+- Np: number of particles to use (process (one-step transition/p(Xn) distribution))
+- plausible **param values need specified** within the pomp object before calculating the likelihood with pfilter
+```{r}
+
+# returns the calculated likelihood of the sir POMP model using particle filtering
+measSIR %>%
+  pfilter(Np=5000) -> pf
+
+# log the likelihood
+logLik(pf)
+
+
+```
+
+### Monte Carlo variablility
+- run few particle filter in parallel for an estimate of **Monte Carlo variability**
+```{r}
+library(doParallel)
+library(doRNG)
+registerDoParallel()
+registerDoRNG(2488820)
+
+foreach(i=1:10,.combine=c) %dopar% {
+  measSIR %>% pfilter(Np=5000)
+} -> pf # 10 runs of particle filter 
+
+logLik(pf) -> ll
+logmeanexp(ll,se=TRUE) #se need to be less than 1 liklihood unit 
+
+
+```
+
+## Exercise 3.2: computer processing time vs. number of particles
+```{r}
+Nps <- ceiling(10^seq(1,5,by=0.2)) # a sequence of number of Nps increase with log
+times <- c()
+for (np in Nps) {
+  times <- c(
+    times,
+    system.time(measSIR %>% pfilter(Np=np))[3]
+  )
+}
+
+plot(Nps,times)
+lm(times~Nps) -> fit
+abline(fit)
+summary(fit)
+
+```
+
+### Exercise 3.3: Log Likelihood Estimatin
+- should have **low** Monte Carlo bias and variance
+  - always need to present with this two values to know the extent of monte carlo uncertainty
+  - **particle filter is an unbiased** estimation of likelihood
+```{r}
+
+## EXPLORE BIAS ####
+
+#estimating the standard error:
+measSIR %>%
+  pfilter(Np=1e5) -> pf
+logLik(pf) -> ll
+logmeanexp(ll,se=TRUE) # calculate standard errors via a jack-knife calculation.
+
+#impact of different values of particles and replicates on log likelihood
+summary_data = data.frame()
+
+for(Np in c(1e3, 1e4, 1e5)){
+  
+  for(Nreps in c(10, 50, 100)){
+    message("On Np ", Np, ", Nreps ", Nreps)
+    
+    foreach (i=1:Nreps, .combine=c,
+             .packages = c("tidyverse", "doParallel")) %dopar% {
+      measSIR %>% pfilter(Np=Np)
+    } -> pf
+    logLik(pf) -> ll
+    
+    temp_data = data.frame(Np = Np, Nreps = Nreps, ll = ll)
+    
+    summary_data = rbind(summary_data, temp_data)
+    
+  }
+  
+}
+
+library(ggplot2)
+
+ggplot(summary_data,aes(x=Np,y=ll,fill=ordered(Nreps),
+    group=interaction(Nreps,Np)))+
+  geom_violin(draw_quantiles=c(0.1,0.5,0.9),alpha=0.7)+
+  scale_x_log10(breaks=unique(summary_data$Np))+
+  labs(fill="number of replicates")
+
+```

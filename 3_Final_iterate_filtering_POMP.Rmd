@@ -1,0 +1,183 @@
+---
+title: "Iterated filtering"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Iterated Filtering
+- repeated particle filtering options, with **randomly perturbed parameter values**, in order to **maximize** the likelihood, instead of direct particle filtering with constant parameter values
+- only **full-information, plug and play, frequentist methods**
+- parameters for each particle filter carried out a **stochaistic perturbation** (random walk)
+- each iteration repeating a particle filter, carried out a **decreasing perturbation**, by applying the collection of parameters vectors at end of a iteration as the starting parameters to the new iteration.
+
+### Data Visualization 
+- first 42 weeks only
+```{r}
+
+read_csv(paste0("https://kingaa.github.io/sbied/stochsim/",
+                "Measles_Consett_1948.csv")) %>%
+  select(week,reports=cases) %>%
+  filter(week <= 42) -> dat
+
+dat %>%
+  ggplot(aes(x=week,y=reports)) +
+  geom_line()
+```
+
+### Impletation of Stochastic SIR model with pomp
+- basic SIR Markov chain
+- assume 1 infection at week 0
+- having one fit model, one should certainly examine **alternative mode**
+  - ex. latency period, better description of the diagonsis, bed-confinement, etc.
+- We **do not track R**, since the compartment has no consequences for the dynamics of the state nor for the data
+```{r}
+
+library(pomp)
+
+sir_step <- Csnippet("
+  double dN_SI = rbinom(S, 1-exp(-Beta*I/N*dt));
+  double dN_IR = rbinom(I, 1-exp(-mu_IR*dt));
+  S -= dN_SI;
+  I += dN_SI - dN_IR;
+  H += dN_IR;"
+  )
+
+sir_init <- Csnippet("
+  S = nearbyint(eta*N);
+  I=1;
+  H=0;"
+  )
+
+dmeas <- Csnippet("
+  lik = dbinom(reports, H, rho,give_log);"
+  )
+
+rmeas <- Csnippet("
+  reports = rbinom(H,rho);"
+  )
+
+dat %>%
+  pomp(
+    times="week",t0=0,
+    rprocess = euler(sir_step,delta.t = 1/7),
+               rinit=sir_init,
+               rmeasure=rmeas,
+               dmeasure=dmeas,
+               accumvars="H",
+               statenames=c("S","I","H"),
+               paramnames=c("Beta","mu_IR","eta","rho","N")
+                     ) -> measSIR
+  
+```
+
+**Testing code**
+- run some simulation and particle filter
+- we will use params from previous exploration
+```{r}
+params <- c(Beta=20, mu_IR=2, rho=0.5, eta=0.1,N=38000)
+
+# Testing with simulation
+measSIR %>% 
+  simulate(params=params, nsim=10, format="data.frame") -> y
+
+y %>% 
+  ggplot(aes(x=week,y=reports,group=.id,color=factor(.id)))+
+  geom_line()+
+  scale_color_brewer(type = "qual",palette=3)+
+  guides(color=FALSE)
+
+# Testing with particle filtering 
+measSIR %>%
+  pfilter(Np=1000,params=params) ->
+  pf
+
+plot(pf)# data, effective sample size of the particle filters (ess) = number of independent particles, log likelihood of each observation conditional on the preceding ones (cond.logLok)
+
+```
+
+### Setting up the estimation problem
+- assume population size is known, N
+- assume we can estimate infectious period  to 3.5 days, thus rate of recovery, u_IR= 1/.5wks = 2wk^-1
+```{r}
+
+fixed_params <- c(N=38000, mu_IR=2)
+ 
+# set up parallel computing
+library(foreach)
+library(doParallel)
+registerDoParallel()
+library(doRNG)
+registerDoRNG(625904618)
+
+# Testing with direct replication of particle filtering
+foreach(i=1:10, .combine=c) %dopar% {
+  library(pomp)
+  measSIR %>% pfilter(params=params, Np=10000)
+} -> pf
+
+# estimate avg loglikelihood and standard error of the replicated pfilter simulation
+pf[[1]] %>% coef() #parameter values after replicated pfilter simulation
+
+
+# estimate the log likelihood of this param vector
+pf %>% logLik() %>% logmeanexp(se=TRUE) -> L_pf  
+L_pf # with se under 1  log unit, the simulation is not bad
+```
+
+### Building up a picture of likelihood surface
+- storing likelihood estimate whenever we compute them
+- set up a **database** to store likelihood of every point we estimated likelihood on
+```{r}
+# set up db
+log_like_db <- "/Users/rachel/Desktop/SISMID/measles_params.csv"
+
+# save param values along with log likelihood as well as se into the database
+# first one from previous direct particle filter replication simulation
+pf[[1]] %>% coef() %>% bind_rows() %>%
+  bind_cols(loglik=L_pf[1],loglik.se=L_pf[2]) %>%
+  write.csv(log_like_db)
+```
+
+### Local search on the likelihood surface with Iterated Filtering
+- mif2
+We need to choose:
+- **rw.sd**, random walk magnitude of perturbation
+- **cooling fraction.50**, standard RW magnitude decreasing after 50 iteration to this fraction
+- estimate params on the **log scale** to constrain the params to be **postive**
+- use perturbation size = 0.02, same for both params Beta and mu_IR
+```{r}
+
+foreach(i=1:20,.combine=c) %dopar% { # 20 independent iterative filtering operations
+  
+  library(pomp)
+  library(tidyverse)
+  measSIR %>%
+    mif2(
+      params=params,
+      Np=2000, Nmif=50,# particle filter with 2000 particles, replicated with iterated filtering for 50 replications
+      partrans=parameter_trans(
+        log = c("Beta"),
+        logit = c("rho","eta"),
+      ), # param transformation
+      paramnames = c("Beta","rho","eta"),
+      cooling.fraction.50=0.5,
+      rw.sd=rw.sd(Beta=0.02,rho=0.02,eta=ivp(0.02)) # ivp, initial value parameter, perturbation only apply at the 1st (beginning) of the time series
+    ) 
+} -> mifs_local
+
+```
+
+### Iterated filtering diagnostics
+```{r}
+mifs_local %>%
+  traces() %>%
+  melt() %>%
+  ggplot(aes(x=iteration,y=value,group=L1,color=factor(L1))) +
+  geom_line() +
+  guides(color=FALSE) +
+  facet_wrap(~variable,scales="free_y")
+
+```
