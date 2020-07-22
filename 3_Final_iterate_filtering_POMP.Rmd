@@ -5,6 +5,7 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+
 ```
 
 ## Iterated Filtering
@@ -16,7 +17,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ### Data Visualization 
 - first 42 weeks only
 ```{r}
-
+library(tidyverse)
 read_csv(paste0("https://kingaa.github.io/sbied/stochsim/",
                 "Measles_Consett_1948.csv")) %>%
   select(week,reports=cases) %>%
@@ -132,7 +133,7 @@ L_pf # with se under 1  log unit, the simulation is not bad
 - set up a **database** to store likelihood of every point we estimated likelihood on
 ```{r}
 # set up db
-log_like_db <- "/Users/rachel/Desktop/SISMID/measles_params.csv"
+log_like_db <- "/Users/rachel/Documents/Github/SISMID2020/measles_params.csv"
 
 # save param values along with log likelihood as well as se into the database
 # first one from previous direct particle filter replication simulation
@@ -142,6 +143,7 @@ pf[[1]] %>% coef() %>% bind_rows() %>%
 ```
 
 ### Local search on the likelihood surface with Iterated Filtering
+- **log likelihood estimation** from each iterated filtering operation will be recorded in the **database** created in the previous block.
 - mif2
 We need to choose:
 - **rw.sd**, random walk magnitude of perturbation
@@ -179,5 +181,127 @@ mifs_local %>%
   geom_line() +
   guides(color=FALSE) +
   facet_wrap(~variable,scales="free_y")
+
+```
+
+### Estimating the likelihood
+- likelihood estimation at the final filtering operation generated a likelihood estimation at the resulting point, but this estimation is **not good enough for a reliable inference**
+  - the **parameter perturbations** was also applied in the **last filtering iteration**
+  - mif2 operations were carried out with fewer particles (Np) than are needed for a good likelihood evaluation.(refer to **Exercise 3.3**, standard error caused by different numbers of Nps)
+- Therefore, we **evaulate the likelihood with standard error** using replicated particle filters at **each point estimate**
+```{r}
+
+foreach(mf=mifs_local,.combine=rbind) %dopar% {
+  library(pomp)
+  library(tidyverse)
+  # add 20000 more particles at each point estimated at iterated operations
+  # evaulate the loglikelihood of each resulting point 
+  # repeat particle filtering for all iterated filtered points for 10 times w/o perturbation to expore the variance
+  evals <- replicate(10,logLik(pfilter(mf,Np=20000))) 
+  ll <- logmeanexp(evals,se=TRUE) # calculate loglike and standard error for the replicated 
+  mf %>% coef() %>% bind_rows() %>% 
+    bind_cols(loglik=ll[1],loglik.se=ll[2])
+  } -> results # 20 loglikelihood from iterated filtering operations
+
+
+```
+
+### Visualize the parameter values from each iterated filtering operations after no perturbated replications with additional particles
+```{r}
+pairs(~loglik + Beta + eta + rho , data = results, pch = 16)
+
+```
+
+
+add these loglikelihood estimations to the **database**
+```{r}
+read_csv(log_like_db) %>%
+  bind_rows(results) %>%
+  arrange(-loglik) %>%
+  write_csv(log_like_db)
+
+
+```
+
+---
+
+## MLE
+
+### global search
+- **parameter estimation** for dynamic system requires both:
+  - **initial values**: state of system at t0 (state space)
+  - **starting values**: parameter values a search is initialized (parameter space)
+- parameter estimation involves trying many starting values or choose a **large box** in parameter space that contains all remotely sensible parameter vectors
+
+### Design box containing reasonable parameter values
+```{r}
+set.seed(2062379496)
+
+# reasonable parameter box for parameter space searching
+runifDesign(
+  lower=c(Beta=5,rho=0.2, eta=0),
+  upper=c(Beta=80,rho=0.9,eta=0.4),
+  nseq=300
+) -> guesses
+
+head(guesses)
+# choose a parameter vector from iterated filtering 
+# search results and model settings from iterated filtering
+mf1 <- mifs_local[[1]] 
+
+```
+### iterating through all starting values in the box designed
+- all parameter vectors in the box will be used as the starting values for the parameter space search
+- iterated filtering (IF) will search through the parameter space with perturbation (random walk)
+- algorithmic arguments perserved from mf1 will be used on mif2
+```{r}
+registerDoRNG(1270401374)
+
+
+foreach(guess=iter(guesses,"row"),.combine=rbind) %dopar% {
+  library(pomp)
+  library(tidyverse)
+  
+  mf1 %>% # search results and model settings from iterated filtering
+    mif2(params=c(unlist(guess),fixed_params)) %>% mif2(Nmif=100) -> mf # each row of param vectors of guesses
+    # last step already had 50 iterations of IF, added 100 more iterations starting from end of last step (with parameter perturbation), all algorithmic parameters are perserved
+    
+  
+  replicate(10,mf %>% pfilter(Np=100000) %>% logLik() #do more pfilter direct replication without parameter perturbation
+            ) %>%
+    logmeanexp(se=TRUE) -> ll # avg loglik and standard error
+  
+  mf %>% coef() %>% bind_rows() %>%
+    bind_cols(loglik=ll[1],loglik.se=ll[2]) # add the estimated loglik to the database
+} -> results
+
+```
+### Visualize global geometry of the likelihood surface
+- grey: starting values, red: end results
+- Optimization attempts from diverse remote staring points **converge** on a particular region in the parameter space
+```{r}
+
+read_csv(log_like_db) %>%
+  filter(loglik > max(loglik) -50) %>% # all the points within the range 0f 50 unit less than MLE
+  bind_rows(guesses) %>%
+  mutate(type=if_else(is.na(loglik),"guess","result")) %>%
+  arrange(type) -> all
+
+pairs(~loglik + Beta + eta + rho, data = all,
+      col=ifelse(all$type=="guess", grey(0.5),"red"),pch=16)
+```
+
+### Poor Man's Profile
+- **global search** projections of the parameter estimates
+```{r}
+all %>% 
+  filter(type=="results") %>%
+  filter(loglik > max(loglik) -50 ) %>%
+  ggplot(aes(x=eta, y=loglik)) +
+  geom_point() +
+  labs(
+    x=expression("eta"),
+    title="Poor man's profile likelihood"
+  )
 
 ```
